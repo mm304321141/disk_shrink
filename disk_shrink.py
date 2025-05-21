@@ -19,12 +19,13 @@ def _format_bytes(size):
     return f"{size:.2f} {units[index]}"
 
 class DiskAnalyzer:
-    def __init__(self, target_path, chunk_size=8192, quiet_mode=False):
+    def __init__(self, target_path, chunk_size=8192, quiet_mode=False, worker_threads=8):
         self.target_path = Path(target_path).expanduser()
         self.file_stats = defaultdict(list)
         self.chunk_size = chunk_size
         self.total_saved = 0
-        self.quiet_mode = quiet_mode  # 新增静默模式开关
+        self.quiet_mode = quiet_mode
+        self.worker_threads = worker_threads  # 保存worker配置
 
     def analyze_filesystem(self):
         """主分析函数"""
@@ -33,9 +34,7 @@ class DiskAnalyzer:
         self._recover_orphaned_files()
         
         for file_path in self.target_path.rglob('*'):
-            # 新增符号链接检查
             if file_path.is_symlink():
-                print(f"⏩ 跳过符号链接：{file_path}")
                 continue
                 
             if file_path.is_file():
@@ -85,8 +84,9 @@ class DiskAnalyzer:
         existing_files = self.file_stats.get(file_hash, [])
         if existing_files:
             if not self.quiet_mode:  # 静默模式下不输出重复文件信息
-                print(f"🔍 发现重复文件：{file_path}")
-                print(f"  原始文件：{existing_files[0]['path']}")
+                relative_path = file_path.relative_to(self.target_path)  # 新增路径转换
+                print(f"🔍 发现重复文件：{relative_path}")
+                print(f"  原始文件：{existing_files[0]['path'].replace(str(self.target_path) + '/', '')}")  # 修改路径显示
                 print(f"  预估节省空间：{_format_bytes(file_size)}\n")
             self.total_saved += file_size
 
@@ -107,44 +107,69 @@ class DiskAnalyzer:
 
     def deduplicate_files(self):
         import uuid
+        import concurrent.futures
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
         
-        for file_hash, files in self.file_stats.items():
-            if len(files) > 1:
-                files.sort(key=lambda x: x['created'])
-                retained = files[0]
+        # 修改为使用实例变量
+        print_lock = threading.Lock()
+        
+        def _process_file_group(files):
+            files.sort(key=lambda x: x['created'])
+            retained = files[0]
+            
+            for f in files[1:]:
+                original_path = f['path']
+                current_file = Path(original_path)
                 
-                for f in files[1:]:
-                    original_path = f['path']
-                    current_file = Path(original_path)
-                    
-                    if not current_file.exists():
+                if not current_file.exists():
+                    with print_lock:
                         print(f"⏩ 跳过已删除文件：{original_path}")
-                        continue
+                    continue
 
-                    temp_path = f"{original_path}.{uuid.uuid4().hex}.bak"
+                temp_path = f"{original_path}.{uuid.uuid4().hex}.bak"
+                
+                try:
+                    src_relative = Path(original_path).relative_to(self.target_path)
+                    dst_relative = Path(retained['path']).relative_to(self.target_path)
+                    with print_lock:
+                        print(f"⌛ 源文件：{src_relative}")
+                        print(f" 目标文件：{dst_relative}")
+
+                    # 保存原始元数据
+                    current_stat = current_file.stat()
                     
-                    try:
-                        print(f"⌛ 开始处理：{original_path}")
-                        
-                        # 保存原始元数据
-                        current_stat = current_file.stat()
-                        
-                        Path(original_path).rename(temp_path)
-                        subprocess.run(['cp', '-c', retained['path'], original_path], check=True)
-                        
-                        # 恢复元数据
-                        os.utime(original_path, (current_stat.st_atime, current_stat.st_mtime))
+                    Path(original_path).rename(temp_path)
+                    subprocess.run(['cp', '-c', retained['path'], original_path], check=True)
+                    
+                    # 恢复元数据
+                    os.utime(original_path, (current_stat.st_atime, current_stat.st_mtime))
 
-                        if not self._compare_files(Path(retained['path']), Path(original_path)):
-                            raise RuntimeError("文件验证失败")
-                            
-                        Path(temp_path).unlink()
-                        print(f"✅ 完成处理：{original_path}\n")
+                    if not self._compare_files(Path(retained['path']), Path(original_path)):
+                        raise RuntimeError("文件验证失败")
                         
-                    except Exception as e:
-                        if Path(temp_path).exists() and not Path(original_path).exists():
-                            Path(temp_path).rename(original_path)
+                    Path(temp_path).unlink()
+                    
+                except Exception as e:
+                    if Path(temp_path).exists() and not Path(original_path).exists():
+                        Path(temp_path).rename(original_path)
+                    with print_lock:
                         print(f"❌ 处理失败：{original_path} ({e})\n")
+
+        with ThreadPoolExecutor(max_workers=self.worker_threads) as executor:  # 使用配置的worker数量
+            futures = []
+            for file_hash, files in self.file_stats.items():
+                if len(files) > 1:
+                    # 为每个文件组提交任务到线程池
+                    futures.append(executor.submit(_process_file_group, files))
+            
+            # 等待所有任务完成
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    with print_lock:
+                        print(f"⚠️ 线程执行异常: {str(e)}")
 
     def _recover_orphaned_files(self):
         import re
@@ -195,9 +220,6 @@ class DiskAnalyzer:
         except ValueError:
             return False
 
-        # 生成唯一临时文件名（保持原有逻辑）
-        temp_path = f"{original_path}.{uuid.uuid4().hex}.bak"
-
 def _check_cow_support(target_path):
     """检查是否满足COW执行条件"""
     target_path = Path(target_path).resolve()
@@ -231,15 +253,17 @@ if __name__ == '__main__':
     parser.add_argument('path', help='要分析的目录路径')
     parser.add_argument('--shrink', action='store_true', 
                        help='执行空间收缩（自动去重+COW恢复）')
+    parser.add_argument('--worker', type=int, default=8,  # 新增worker参数
+                       help='设置工作线程数量 (默认: 8)')
     args = parser.parse_args()
 
     # 执行前置检查
     if args.shrink:
         print("🔍 正在检查系统环境...")
         _check_cow_support(args.path)
-        print("✅ 环境检查通过（macOS + APFS）\n")
+        print("✅ 环境检查通过（macOS + APFS）")
 
-    analyzer = DiskAnalyzer(args.path, quiet_mode=args.shrink)
+    analyzer = DiskAnalyzer(args.path, quiet_mode=args.shrink, worker_threads=args.worker)  # 修改构造函数调用
     report = analyzer.analyze_filesystem()
     
     # 当不指定参数时显示分析报告
